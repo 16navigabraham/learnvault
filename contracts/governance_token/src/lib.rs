@@ -14,9 +14,14 @@
 //! Implements: https://github.com/bakeronchain/learnvault/issues/11
 
 use soroban_sdk::{
-    Address, Env, String, Symbol, contract, contracterror, contractevent, contractimpl,
+    Address, BytesN, Env, String, Symbol, contract, contracterror, contractevent, contractimpl,
     contracttype, panic_with_error, symbol_short,
 };
+
+#[path = "../../shared/upgrade.rs"]
+mod upgrade;
+
+pub use upgrade::ContractUpgraded;
 
 // ---------------------------------------------------------------------------
 // Storage Constants (assuming ~6s ledger time)
@@ -48,6 +53,8 @@ pub enum GOVError {
     InvalidExpiration = 5,
     /// Allowance exists but is expired at current ledger.
     AllowanceExpired = 6,
+    /// Contract is paused; all state-mutating calls are blocked.
+    ContractPaused = 7,
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +65,7 @@ const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const NAME_KEY: Symbol = symbol_short!("NAME");
 const SYMBOL_KEY: Symbol = symbol_short!("SYMBOL");
 const DECIMALS_KEY: Symbol = symbol_short!("DECIMALS");
+const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 
 #[contracttype]
 pub enum DataKey {
@@ -71,6 +79,41 @@ pub enum DataKey {
 #[contractevent]
 pub struct GOVBurned {
     pub from: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GOVPaused {
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GOVUnpaused {
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GOVMinted {
+    pub to: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GOVTransferred {
+    pub from: Address,
+    pub to: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GOVApproved {
+    pub owner: Address,
+    pub spender: Address,
     pub amount: i128,
 }
 
@@ -91,6 +134,7 @@ impl GovernanceToken {
             panic_with_error!(&env, GOVError::Unauthorized);
         }
         env.storage().instance().set(&ADMIN_KEY, &admin);
+        upgrade::init(&env);
         env.storage()
             .instance()
             .set(&NAME_KEY, &String::from_str(&env, "LearnVault Governance"));
@@ -108,6 +152,7 @@ impl GovernanceToken {
 
     /// Mint `amount` GOV to `to`. Admin only.
     pub fn mint(env: Env, to: Address, amount: i128) {
+        Self::assert_not_paused(&env);
         Self::extend_instance(&env);
         let admin: Address = env
             .storage()
@@ -142,10 +187,13 @@ impl GovernanceToken {
         env.storage()
             .instance()
             .set(&DataKey::TotalSupply, &(supply + amount));
+
+        GOVMinted { to, amount }.publish(&env);
     }
 
     /// Burn `amount` from the caller's own balance.
     pub fn burn(env: Env, from: Address, amount: i128) {
+        Self::assert_not_paused(&env);
         Self::extend_instance(&env);
         from.require_auth();
         if amount <= 0 {
@@ -202,12 +250,71 @@ impl GovernanceToken {
         env.storage().instance().set(&ADMIN_KEY, &new_admin);
     }
 
+    /// Replace the current contract WASM with a new uploaded hash. Admin only.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        Self::extend_instance(&env);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, GOVError::NotInitialized));
+        admin.require_auth();
+        upgrade::apply(&env, &admin, &new_wasm_hash);
+    }
+
+    // -----------------------------------------------------------------------
+    // Emergency pause / unpause
+    // -----------------------------------------------------------------------
+
+    /// Pause the contract. Admin only.
+    ///
+    /// Blocks `mint`, `transfer`, `burn`, and `approve` until unpaused.
+    pub fn pause(env: Env, admin: Address) {
+        Self::extend_instance(&env);
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, GOVError::NotInitialized));
+        if admin != stored_admin {
+            panic_with_error!(&env, GOVError::Unauthorized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&PAUSED_KEY, &true);
+        GOVPaused { admin }.publish(&env);
+    }
+
+    /// Unpause the contract. Admin only.
+    pub fn unpause(env: Env, admin: Address) {
+        Self::extend_instance(&env);
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, GOVError::NotInitialized));
+        if admin != stored_admin {
+            panic_with_error!(&env, GOVError::Unauthorized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&PAUSED_KEY, &false);
+        GOVUnpaused { admin }.publish(&env);
+    }
+
+    /// Returns `true` if the contract is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&PAUSED_KEY)
+            .unwrap_or(false)
+    }
+
     // -----------------------------------------------------------------------
     // SEP-41 transfers
     // -----------------------------------------------------------------------
 
     /// Transfer `amount` GOV from `from` to `to`. Requires `from` auth.
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        Self::assert_not_paused(&env);
         Self::extend_instance(&env);
         from.require_auth();
         if amount <= 0 {
@@ -215,6 +322,8 @@ impl GovernanceToken {
         }
         Self::_debit(&env, &from, amount);
         Self::_credit(&env, &to, amount);
+
+        GOVTransferred { from, to, amount }.publish(&env);
     }
 
     /// Approve `spender` to spend up to `amount` on behalf of `owner`.
@@ -225,17 +334,25 @@ impl GovernanceToken {
         amount: i128,
         expiration_ledger: u32,
     ) {
+        Self::assert_not_paused(&env);
         owner.require_auth();
         let current_ledger = env.ledger().sequence();
         if expiration_ledger < current_ledger {
             panic_with_error!(&env, GOVError::InvalidExpiration);
         }
 
-        let key = DataKey::Allowance(owner, spender);
+        let key = DataKey::Allowance(owner.clone(), spender.clone());
         env.storage()
             .persistent()
             .set(&key, &(amount, expiration_ledger));
         Self::extend_persistent(&env, &key);
+
+        GOVApproved {
+            owner,
+            spender,
+            amount,
+        }
+        .publish(&env);
     }
 
     /// Transfer `amount` from `from` to `to` using `spender`'s allowance.
@@ -270,6 +387,8 @@ impl GovernanceToken {
 
         Self::_debit(&env, &from, amount);
         Self::_credit(&env, &to, amount);
+
+        GOVTransferred { from, to, amount }.publish(&env);
     }
 
     // -----------------------------------------------------------------------
@@ -441,6 +560,17 @@ impl GovernanceToken {
         }
     }
 
+    fn assert_not_paused(env: &Env) {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&PAUSED_KEY)
+            .unwrap_or(false);
+        if paused {
+            panic_with_error!(env, GOVError::ContractPaused);
+        }
+    }
+
     fn extend_instance(env: &Env) {
         env.storage()
             .instance()
@@ -463,11 +593,11 @@ mod test {
     extern crate std;
 
     use soroban_sdk::{
-        Address, Env, IntoVal, String,
-        testutils::{Address as _, Ledger, LedgerInfo},
+        Address, BytesN, Env, IntoVal, String,
+        testutils::{Address as _, Ledger, LedgerInfo, MockAuth, MockAuthInvoke},
     };
 
-    use crate::{GOVError, GovernanceToken, GovernanceTokenClient};
+    use crate::{DataKey, GOVError, GovernanceToken, GovernanceTokenClient};
 
     fn setup(e: &Env) -> (Address, Address, GovernanceTokenClient) {
         let admin = Address::generate(e);
@@ -476,6 +606,18 @@ mod test {
         let client = GovernanceTokenClient::new(e, &id);
         client.initialize(&admin);
         (id, admin, client)
+    }
+
+    fn authorize_upgrade(env: &Env, contract_id: &Address, signer: &Address, wasm_hash: &BytesN<32>) {
+        env.mock_auths(&[MockAuth {
+            address: signer,
+            invoke: &MockAuthInvoke {
+                contract: contract_id,
+                fn_name: "upgrade",
+                args: (wasm_hash.clone(),).into_val(env),
+                sub_invokes: &[],
+            },
+        }]);
     }
 
     fn set_ledger_sequence(env: &Env, sequence_number: u32) {
@@ -504,6 +646,63 @@ mod test {
         assert_eq!(client.name(), String::from_str(&e, "LearnVault Governance"));
         assert_eq!(client.symbol(), String::from_str(&e, "GOV"));
         assert_eq!(client.decimals(), 7);
+    }
+
+    #[test]
+    fn upgrade_requires_admin_auth() {
+        let e = Env::default();
+        let admin = Address::generate(&e);
+        let attacker = Address::generate(&e);
+        let id = e.register(GovernanceToken, ());
+
+        e.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &id,
+                fn_name: "initialize",
+                args: (admin.clone(),).into_val(&e),
+                sub_invokes: &[],
+            },
+        }]);
+
+        let client = GovernanceTokenClient::new(&e, &id);
+        client.initialize(&admin);
+
+        let wasm_hash = crate::upgrade::testutils::upload_upgrade_target(&e);
+        authorize_upgrade(&e, &id, &attacker, &wasm_hash);
+        assert!(client.try_upgrade(&wasm_hash).is_err());
+    }
+
+    #[test]
+    fn state_persists_after_upgrade() {
+        let e = Env::default();
+        let (id, admin, client) = setup(&e);
+        let donor = Address::generate(&e);
+
+        client.mint(&donor, &500);
+
+        e.set_auths(&[]);
+        let wasm_hash = crate::upgrade::testutils::upload_upgrade_target(&e);
+        authorize_upgrade(&e, &id, &admin, &wasm_hash);
+        client.upgrade(&wasm_hash);
+
+        let balance = e.as_contract(&id, || {
+            e.storage()
+                .persistent()
+                .get::<_, i128>(&DataKey::Balance(donor.clone()))
+                .unwrap_or(0)
+        });
+        let supply = e.as_contract(&id, || {
+            e.storage()
+                .instance()
+                .get::<_, i128>(&DataKey::TotalSupply)
+                .unwrap_or(0)
+        });
+        let stored_hash = e.as_contract(&id, || crate::upgrade::current_hash(&e));
+
+        assert_eq!(balance, 500);
+        assert_eq!(supply, 500);
+        assert_eq!(stored_hash, wasm_hash);
     }
 
     #[test]
@@ -1037,5 +1236,109 @@ mod test {
 
         client.burn(&alice, &40);
         assert_eq!(client.get_voting_power(&bob), 60);
+    }
+
+    // --- pause / unpause ---
+
+    #[test]
+    fn pause_blocks_mint_transfer_burn_approve() {
+        let e = Env::default();
+        let (id, admin, client) = setup(&e);
+        let alice = Address::generate(&e);
+        let bob = Address::generate(&e);
+
+        // Mint some tokens before pausing
+        client.mint(&alice, &500);
+
+        // Pause the contract
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        // mint is blocked
+        let res = client.try_mint(&alice, &100);
+        assert_eq!(
+            res.err(),
+            Some(Ok(soroban_sdk::Error::from_contract_error(
+                GOVError::ContractPaused as u32
+            )))
+        );
+
+        // transfer is blocked
+        let res = client.try_transfer(&alice, &bob, &10);
+        assert_eq!(
+            res.err(),
+            Some(Ok(soroban_sdk::Error::from_contract_error(
+                GOVError::ContractPaused as u32
+            )))
+        );
+
+        // burn is blocked
+        let res = client.try_burn(&alice, &10);
+        assert_eq!(
+            res.err(),
+            Some(Ok(soroban_sdk::Error::from_contract_error(
+                GOVError::ContractPaused as u32
+            )))
+        );
+
+        // approve is blocked
+        let res = client.try_approve(&alice, &bob, &50, &valid_expiration(&e));
+        assert_eq!(
+            res.err(),
+            Some(Ok(soroban_sdk::Error::from_contract_error(
+                GOVError::ContractPaused as u32
+            )))
+        );
+
+        let _ = id;
+    }
+
+    #[test]
+    fn unpause_restores_operations() {
+        let e = Env::default();
+        let (_, admin, client) = setup(&e);
+        let alice = Address::generate(&e);
+
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+
+        // mint should succeed again
+        client.mint(&alice, &100);
+        assert_eq!(client.balance(&alice), 100);
+    }
+
+    #[test]
+    fn non_admin_cannot_pause() {
+        let e = Env::default();
+        let (_, _, client) = setup(&e);
+        let attacker = Address::generate(&e);
+
+        let res = client.try_pause(&attacker);
+        assert_eq!(
+            res.err(),
+            Some(Ok(soroban_sdk::Error::from_contract_error(
+                GOVError::Unauthorized as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn non_admin_cannot_unpause() {
+        let e = Env::default();
+        let (_, admin, client) = setup(&e);
+        let attacker = Address::generate(&e);
+
+        client.pause(&admin);
+
+        let res = client.try_unpause(&attacker);
+        assert_eq!(
+            res.err(),
+            Some(Ok(soroban_sdk::Error::from_contract_error(
+                GOVError::Unauthorized as u32
+            )))
+        );
     }
 }
