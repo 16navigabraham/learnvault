@@ -5,6 +5,7 @@ import AddressDisplay from "../components/AddressDisplay"
 import { EmptyState } from "../components/states/emptyState"
 import { ErrorState } from "../components/states/errorState"
 import { useWallet } from "../hooks/useWallet"
+import { API_URL } from "../lib/api"
 import { type LeaderboardEntry } from "../util/mockLeaderboardData"
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:4000"
@@ -27,9 +28,8 @@ const Leaderboard: React.FC = () => {
 	useEffect(() => {
 		const fetchLeaderboard = async () => {
 			try {
-				const response = await fetch(
-					`${API_URL}/api/scholars/leaderboard?page=1&limit=25`,
-				)
+				const response = await fetch(`${API_URL}/api/scholars/leaderboard`)
+
 				if (!response.ok) throw new Error("Failed to fetch leaderboard")
 				const result = (await response.json()) as {
 					rankings?: LeaderboardApiEntry[]

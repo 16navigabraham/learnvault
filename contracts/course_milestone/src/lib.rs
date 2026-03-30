@@ -2,12 +2,28 @@
 #![allow(deprecated)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error,
-    symbol_short, Address, Env, String, Symbol, Vec,
+    Address, BytesN, Env, String, Symbol, Vec, contract, contracterror, contractimpl,
+    contracttype,
+    panic_with_error, symbol_short,
 };
+
+/// A single entry in a batch verification call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct VerifyBatchEntry {
+    pub learner: Address,
+    pub course_id: String,
+    pub milestone_id: u32,
+    pub lrn_reward: i128,
+}
 
 mod interface;
 use interface::LearnTokenClient;
+
+#[path = "../../shared/upgrade.rs"]
+mod upgrade;
+
+pub use upgrade::ContractUpgraded;
 
 const DAY_IN_LEDGERS: u32 = 17_280;
 const INSTANCE_BUMP_THRESHOLD: u32 = DAY_IN_LEDGERS;
@@ -125,6 +141,7 @@ impl CourseMilestone {
         }
         admin.require_auth();
         env.storage().instance().set(&ADMIN_KEY, &admin);
+        upgrade::init(&env);
         env.storage()
             .instance()
             .set(&LEARN_TOKEN_KEY, &learn_token_contract);
@@ -404,7 +421,7 @@ impl CourseMilestone {
             .persistent()
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
-        if courses.len() > 0 {
+        if !courses.is_empty() {
             Self::extend_persistent(&env, &key);
         }
         courses
@@ -440,7 +457,11 @@ impl CourseMilestone {
         }
 
         let reward_key = DataKey::MilestoneLrn(course_id.clone(), milestone_id);
-        let lrn_reward = env.storage().persistent().get(&reward_key).unwrap_or(0_i128);
+        let lrn_reward = env
+            .storage()
+            .persistent()
+            .get(&reward_key)
+            .unwrap_or(0_i128);
 
         env.storage().persistent().set(&completed_key, &true);
         env.storage()
@@ -456,20 +477,17 @@ impl CourseMilestone {
         env.events().publish(
             (symbol_short!("ms_done"),),
             MilestoneCompleted {
-                learner,
-                course_id,
+                learner: learner.clone(),
+                course_id: course_id.clone(),
                 milestone_id,
                 lrn_reward,
             },
         );
+
+        Self::emit_course_completed_if_ready(&env, &learner, &course_id);
     }
 
-    pub fn is_completed(
-        env: Env,
-        learner: Address,
-        course_id: String,
-        milestone_id: u32,
-    ) -> bool {
+    pub fn is_completed(env: Env, learner: Address, course_id: String, milestone_id: u32) -> bool {
         let completed_key = DataKey::Completed(learner, course_id, milestone_id);
         let completed = env
             .storage()
@@ -480,6 +498,15 @@ impl CourseMilestone {
             Self::extend_persistent(&env, &completed_key);
         }
         completed
+    }
+
+    /// Replace the current contract WASM with a new uploaded hash. Admin only.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        Self::require_initialized(&env);
+        Self::extend_instance(&env);
+        let admin: Address = env.storage().instance().get(&ADMIN_KEY).unwrap();
+        admin.require_auth();
+        upgrade::apply(&env, &admin, &new_wasm_hash);
     }
 
     pub fn get_version(env: Env) -> String {
@@ -543,6 +570,86 @@ impl CourseMilestone {
                 lrn_reward: tokens_amount,
             },
         );
+
+        Self::emit_course_completed_if_ready(&env, &learner, &course_id);
+    }
+
+    /// Verify multiple milestone submissions in a single atomic transaction.
+    ///
+    /// Each [`VerifyBatchEntry`] is `(learner, course_id, milestone_id, lrn_reward)`.
+    /// If any single verification fails the entire batch reverts.
+    /// Emits a `MilestoneCompleted` event for each successful entry.
+    pub fn batch_verify_milestones(
+        env: Env,
+        admin: Address,
+        submissions: Vec<VerifyBatchEntry>,
+    ) {
+        if Self::is_paused(env.clone()) {
+            panic_with_error!(&env, Error::ContractPaused);
+        }
+
+        Self::require_initialized(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = env.storage().instance().get(&ADMIN_KEY).unwrap();
+        if admin != stored_admin {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        let mut i = 0;
+        while i < submissions.len() {
+            let entry = submissions.get(i).unwrap();
+
+            if !Self::is_enrolled(env.clone(), entry.learner.clone(), entry.course_id.clone()) {
+                panic_with_error!(&env, Error::NotEnrolled);
+            }
+
+            let state_key = DataKey::MilestoneState(
+                entry.learner.clone(),
+                entry.course_id.clone(),
+                entry.milestone_id,
+            );
+            let current_state = env
+                .storage()
+                .persistent()
+                .get::<_, MilestoneStatus>(&state_key)
+                .unwrap_or(MilestoneStatus::NotStarted);
+
+            if current_state != MilestoneStatus::Pending {
+                panic_with_error!(&env, Error::InvalidState);
+            }
+
+            env.storage()
+                .persistent()
+                .set(&state_key, &MilestoneStatus::Approved);
+
+            let completed_key = DataKey::Completed(
+                entry.learner.clone(),
+                entry.course_id.clone(),
+                entry.milestone_id,
+            );
+            env.storage().persistent().set(&completed_key, &true);
+
+            let learn_token_address: Address =
+                env.storage().instance().get(&LEARN_TOKEN_KEY).unwrap();
+            let learn_token_client = LearnTokenClient::new(&env, &learn_token_address);
+            learn_token_client.mint(&entry.learner, &entry.lrn_reward);
+
+            Self::extend_persistent(&env, &state_key);
+            Self::extend_persistent(&env, &completed_key);
+
+            env.events().publish(
+                (symbol_short!("ms_done"),),
+                MilestoneCompleted {
+                    learner: entry.learner.clone(),
+                    course_id: entry.course_id.clone(),
+                    milestone_id: entry.milestone_id,
+                    lrn_reward: entry.lrn_reward,
+                },
+            );
+
+            i += 1;
+        }
     }
 
     pub fn reject_milestone(
@@ -627,6 +734,42 @@ impl CourseMilestone {
             }
             None => false,
         }
+    }
+
+    fn emit_course_completed_if_ready(env: &Env, learner: &Address, course_id: &String) {
+        let course_key = DataKey::Course(course_id.clone());
+        let config: CourseConfig = match env.storage().persistent().get(&course_key) {
+            Some(cfg) => cfg,
+            None => return,
+        };
+        Self::extend_persistent(env, &course_key);
+
+        let mut milestone_id = 1_u32;
+        while milestone_id <= config.milestone_count {
+            let state_key = DataKey::MilestoneState(
+                learner.clone(),
+                course_id.clone(),
+                milestone_id,
+            );
+            let state = env
+                .storage()
+                .persistent()
+                .get::<_, MilestoneStatus>(&state_key)
+                .unwrap_or(MilestoneStatus::NotStarted);
+            if state != MilestoneStatus::Approved {
+                return;
+            }
+            Self::extend_persistent(env, &state_key);
+            milestone_id += 1;
+        }
+
+        env.events().publish(
+            (Symbol::new(env, "course_done"),),
+            CourseCompleted {
+                learner: learner.clone(),
+                course_id: course_id.clone(),
+            },
+        );
     }
 
     fn extend_instance(env: &Env) {
