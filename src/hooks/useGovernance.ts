@@ -2,29 +2,28 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useCallback } from "react"
 import { useToast } from "../components/Toast/ToastProvider"
 import { ErrorCode, createAppError } from "../types/errors"
+import type { RawContractProposal } from "../types/governance"
+import type { Proposal } from "../types/contracts"
 import { type Proposal, type RawContractProposal } from "../types/governance"
+import { logger } from "../utils/logger"
 import { isUserRejection, parseError } from "../utils/errors"
+import { useContractIds } from "./useContractIds"
 import { useWallet } from "./useWallet"
 
+// expose the canonical Proposal type for consumers of this module
 export type { Proposal }
 
 type ContractRecord = Record<string, unknown>
 
-const readEnv = (key: string): string | undefined => {
-	const value = (import.meta.env as Record<string, unknown>)[key]
-	return typeof value === "string" && value.length ? value : undefined
-}
-
-const SCHOLARSHIP_TREASURY_CONTRACT = readEnv(
-	"PUBLIC_SCHOLARSHIP_TREASURY_CONTRACT",
-)
-const GOVERNANCE_TOKEN_CONTRACT = readEnv("PUBLIC_GOVERNANCE_TOKEN_CONTRACT")
+// The expected contract version this client was generated against.
+const EXPECTED_CONTRACT_VERSION = "1.0.0"
 
 /**
  * Hook to manage governance interactions: reading proposals, voting power, and casting votes.
  */
 export function useGovernance() {
 	const { address, signTransaction } = useWallet()
+	const { scholarshipTreasury, governanceToken } = useContractIds()
 	const queryClient = useQueryClient()
 	const { showSuccess, showError, showInfo } = useToast()
 
@@ -79,50 +78,38 @@ export function useGovernance() {
 
 	const toProposalStatus = useCallback(
 		(status: unknown): Proposal["status"] => {
-			const normalized = String(status ?? "Pending").toLowerCase()
-			if (normalized === "approved" || normalized === "passed") return "Passed"
-			if (normalized === "rejected") return "Rejected"
-			return "Active"
-		},
+				const normalized = String(status ?? "pending").toLowerCase()
+				if (normalized === "approved" || normalized === "passed") return "approved"
+				if (normalized === "rejected") return "rejected"
+				return "pending"
+			},
 		[],
 	)
 
 	const mapProposal = useCallback(
 		(
-			rawProposal: RawContractProposal,
-			fallbackStatus: Proposal["status"],
-		): Proposal => ({
-			id: Number(rawProposal.id ?? 0),
-			title: String(rawProposal.program_name ?? rawProposal.title ?? ""),
-			description: String(
-				rawProposal.program_description ?? rawProposal.description ?? "",
-			),
-			author: String(
-				rawProposal.applicant ??
-					rawProposal.author ??
-					rawProposal.author_address ??
-					"",
-			),
-			status: toProposalStatus(rawProposal.status ?? fallbackStatus),
-			votesFor: toBigIntSafe(
-				rawProposal.yes_votes ??
-					rawProposal.votes_for ??
-					rawProposal.votesFor ??
-					0,
-			),
-			votesAgainst: toBigIntSafe(
-				rawProposal.no_votes ??
-					rawProposal.votes_against ??
-					rawProposal.votesAgainst ??
-					0,
-			),
-			endDate: Number(
-				rawProposal.deadline_ledger ??
-					rawProposal.end_date ??
-					rawProposal.endDate ??
-					0,
-			),
-		}),
+				rawProposal: RawContractProposal,
+				fallbackStatus: Proposal["status"],
+			): Proposal => ({
+				id: Number(rawProposal.id ?? 0),
+				proposer: String(
+					rawProposal.applicant ??
+						rawProposal.author ??
+						rawProposal.author_address ??
+						"",
+				),
+				amount: toBigIntSafe(rawProposal.amount ?? 0),
+				description: String(
+					rawProposal.program_description ?? rawProposal.description ?? "",
+				),
+				votes_for: toBigIntSafe(
+					rawProposal.yes_votes ?? rawProposal.votes_for ?? rawProposal.votesFor ?? 0,
+				),
+				votes_against: toBigIntSafe(
+					rawProposal.no_votes ?? rawProposal.votes_against ?? rawProposal.votesAgainst ?? 0,
+				),
+				status: toProposalStatus(rawProposal.status ?? fallbackStatus),
+			}),
 		[toBigIntSafe, toProposalStatus],
 	)
 
@@ -164,9 +151,10 @@ export function useGovernance() {
 		(value: unknown): unknown => {
 			const resolved = unwrapResult(value)
 			if (isErrResult(resolved)) {
+				const maybeUnwrapErr = (resolved as ContractRecord).unwrapErr
 				const errorValue =
-					typeof (resolved as ContractRecord).unwrapErr === "function"
-						? (resolved as ContractRecord).unwrapErr()
+					typeof maybeUnwrapErr === "function"
+						? (maybeUnwrapErr as () => unknown)()
 						: new Error("Transaction failed")
 				throw errorValue instanceof Error
 					? errorValue
@@ -177,11 +165,36 @@ export function useGovernance() {
 				typeof resolved === "object" &&
 				typeof (resolved as ContractRecord).unwrap === "function"
 			) {
-				return (resolved as ContractRecord).unwrap()
+				const maybeUnwrap = (resolved as ContractRecord).unwrap as
+					| (() => unknown)
+					| undefined
+				return maybeUnwrap ? maybeUnwrap() : resolved
 			}
 			return resolved
 		},
 		[isErrResult, unwrapResult],
+	)
+
+	const toBooleanSafe = useCallback(
+		(value: unknown): boolean => {
+			const resolved = unwrapResult(value)
+			if (typeof resolved === "boolean") return resolved
+			if (typeof resolved === "number") return resolved !== 0
+			if (typeof resolved === "string") {
+				const normalized = resolved.trim().toLowerCase()
+				return (
+					normalized === "true" || normalized === "yes" || normalized === "for"
+				)
+			}
+			if (resolved && typeof resolved === "object") {
+				const maybe = resolved as ContractRecord
+				if (typeof maybe.support === "boolean") return maybe.support
+				if (typeof maybe.vote === "boolean") return maybe.vote
+				if (typeof maybe.value === "boolean") return maybe.value
+			}
+			return false
+		},
+		[unwrapResult],
 	)
 
 	// Helper to load contract clients
@@ -193,7 +206,7 @@ export function useGovernance() {
 			>
 			return (mod.default as Record<string, unknown>) ?? mod
 		} catch (err) {
-			console.warn(
+			logger.warn(
 				createAppError(
 					ErrorCode.CONTRACT_NOT_DEPLOYED,
 					"Contract not available",
@@ -205,11 +218,74 @@ export function useGovernance() {
 		}
 	}, [])
 
+	// Version checks — warn if deployed contract versions don't match expected
+	useQuery({
+		queryKey: ["governance", "version", "governance_token"],
+		queryFn: async (): Promise<string | null> => {
+			if (!governanceToken) return null
+			const client = await loadClient("../contracts/governance_token")
+			if (!client) return null
+			const fn = asMethod(client, "get_version")
+			if (!fn) return null
+			try {
+				const raw = await fn({})
+				const version = String(
+					(raw !== null &&
+					typeof raw === "object" &&
+					"result" in (raw as ContractRecord)
+						? (raw as ContractRecord).result
+						: raw) ?? "",
+				)
+				if (version && version !== EXPECTED_CONTRACT_VERSION) {
+					logger.warn(
+						`[GovernanceToken] Version mismatch: expected ${EXPECTED_CONTRACT_VERSION}, got ${version}. ` +
+							"Client bindings may be out of date.",
+					)
+				}
+				return version
+			} catch {
+				return null
+			}
+		},
+		staleTime: Infinity,
+	})
+
+	useQuery({
+		queryKey: ["governance", "version", "scholarship_treasury"],
+		queryFn: async (): Promise<string | null> => {
+			if (!scholarshipTreasury) return null
+			const client = await loadClient("../contracts/scholarship_treasury")
+			if (!client) return null
+			const fn = asMethod(client, "get_version")
+			if (!fn) return null
+			try {
+				const raw = await fn({})
+				const version = String(
+					(raw !== null &&
+					typeof raw === "object" &&
+					"result" in (raw as ContractRecord)
+						? (raw as ContractRecord).result
+						: raw) ?? "",
+				)
+				if (version && version !== EXPECTED_CONTRACT_VERSION) {
+					logger.warn(
+						`[ScholarshipTreasury] Version mismatch: expected ${EXPECTED_CONTRACT_VERSION}, got ${version}. ` +
+							"Client bindings may be out of date.",
+					)
+				}
+				return version
+			} catch {
+				return null
+			}
+		},
+		staleTime: Infinity,
+	})
+
 	// Fetch voting power (GOV token balance)
 	const { data: votingPower = 0n } = useQuery({
 		queryKey: ["governance", "votingPower", address],
 		queryFn: async () => {
-			if (!address || !GOVERNANCE_TOKEN_CONTRACT) return 0n
+			if (!address || !governanceToken) return 0n
 			const client = await loadClient("../contracts/governance_token")
 			if (!client) return 0n
 
@@ -242,7 +318,7 @@ export function useGovernance() {
 	>({
 		queryKey: ["governance", "proposals"],
 		queryFn: async () => {
-			if (!SCHOLARSHIP_TREASURY_CONTRACT) return []
+			if (!scholarshipTreasury) return []
 			const client = await loadClient("../contracts/scholarship_treasury")
 			if (!client) return []
 
@@ -263,13 +339,13 @@ export function useGovernance() {
 			)
 
 			const grouped = [
-				...pending.map((proposal) =>
+				...pending.map((proposal: unknown) =>
 					mapProposal(proposal as RawContractProposal, "Active"),
 				),
-				...approved.map((proposal) =>
+				...approved.map((proposal: unknown) =>
 					mapProposal(proposal as RawContractProposal, "Passed"),
 				),
-				...rejected.map((proposal) =>
+				...rejected.map((proposal: unknown) =>
 					mapProposal(proposal as RawContractProposal, "Rejected"),
 				),
 			]
@@ -281,7 +357,7 @@ export function useGovernance() {
 				["get_proposals", "getProposals"],
 				[[]],
 			)
-			return fallback.map((proposal) =>
+			return fallback.map((proposal: unknown) =>
 				mapProposal(proposal as RawContractProposal, "Active"),
 			)
 		},
@@ -289,13 +365,30 @@ export function useGovernance() {
 
 	// Check if voter has already voted on a specific proposal
 	const hasVoted = useCallback(
-		(proposalId: number) => {
+		(proposalId: number, voterAddress?: string) => {
+			const resolvedAddress = voterAddress ?? address
+			if (!resolvedAddress) return false
 			return !!queryClient.getQueryData([
 				"governance",
 				"voted",
 				proposalId,
-				address,
+				resolvedAddress,
 			])
+		},
+		[address, queryClient],
+	)
+
+	const getVoteChoice = useCallback(
+		(proposalId: number, voterAddress?: string): boolean | null => {
+			const resolvedAddress = voterAddress ?? address
+			if (!resolvedAddress) return null
+			const cached = queryClient.getQueryData([
+				"governance",
+				"voteChoice",
+				proposalId,
+				resolvedAddress,
+			])
+			return typeof cached === "boolean" ? cached : null
 		},
 		[address, queryClient],
 	)
@@ -304,17 +397,24 @@ export function useGovernance() {
 	useQuery({
 		queryKey: ["governance", "voted", address],
 		queryFn: async () => {
-			if (!address || !SCHOLARSHIP_TREASURY_CONTRACT || proposals.length === 0)
+			if (!address || !scholarshipTreasury || proposals.length === 0)
 				return {}
 			const client = await loadClient("../contracts/scholarship_treasury")
 			if (!client) return {}
 
 			const hasVotedFn = asMethod(client, "has_voted", "hasVoted")
+			const voteChoiceFn = asMethod(
+				client,
+				"get_vote",
+				"getVote",
+				"vote_of",
+				"voteOf",
+			)
 			if (!hasVotedFn) return {}
 
 			const results: Record<number, boolean> = {}
 			await Promise.all(
-				proposals.map(async (p) => {
+				proposals.map(async (p: Proposal) => {
 					try {
 						const voted = await hasVotedFn({
 							voter: address,
@@ -326,6 +426,24 @@ export function useGovernance() {
 							["governance", "voted", p.id, address],
 							results[p.id],
 						)
+						if (results[p.id] && voteChoiceFn) {
+							for (const args of [
+								[{ voter: address, proposal_id: p.id }],
+								[{ address, proposal_id: p.id }],
+								[p.id, address],
+							]) {
+								try {
+									const choice = await voteChoiceFn(...args)
+									queryClient.setQueryData(
+										["governance", "voteChoice", p.id, address],
+										toBooleanSafe(choice),
+									)
+									break
+								} catch {
+									continue
+								}
+							}
+						}
 					} catch {
 						results[p.id] = false
 					}
@@ -346,7 +464,7 @@ export function useGovernance() {
 			support: boolean
 		}) => {
 			if (!address) throw new Error("Wallet not connected")
-			if (!SCHOLARSHIP_TREASURY_CONTRACT)
+			if (!scholarshipTreasury)
 				throw new Error("Contract not configured")
 
 			const client = await loadClient("../contracts/scholarship_treasury")
@@ -364,10 +482,14 @@ export function useGovernance() {
 				{ publicKey: address },
 			)
 
+			showInfo("Waiting for wallet approval…")
 			const sendResult = await sendTxIfNeeded(tx)
 			unwrapSendResult(sendResult)
 		},
-		onSuccess: (_, { proposalId }) => {
+		onSuccess: (
+			_: void,
+			{ proposalId, support }: { proposalId: number; support: boolean },
+		) => {
 			showSuccess("Vote submitted successfully!")
 			// Invalidate queries to refresh UI
 			void queryClient.invalidateQueries({
@@ -380,6 +502,10 @@ export function useGovernance() {
 			queryClient.setQueryData(
 				["governance", "voted", proposalId, address],
 				true,
+			)
+			queryClient.setQueryData(
+				["governance", "voteChoice", proposalId, address],
+				support,
 			)
 		},
 
@@ -407,5 +533,7 @@ export function useGovernance() {
 			castVote({ proposalId, support }),
 		isVoting,
 		hasVoted,
+		getVoteChoice,
+		walletAddress: address,
 	}
 }

@@ -10,6 +10,12 @@ export interface MilestoneReport {
 	evidence_description?: string | null
 	status: "pending" | "approved" | "rejected"
 	submitted_at: string
+	scholar_email?: string
+	scholar_name?: string
+	course_title?: string
+	milestone_title?: string
+	milestone_number?: number
+	lrn_reward?: number
 }
 
 export interface MilestoneAuditEntry {
@@ -20,6 +26,16 @@ export interface MilestoneAuditEntry {
 	rejection_reason?: string | null
 	contract_tx_hash?: string | null
 	decided_at: string
+}
+
+export interface MilestoneReportFilters {
+	courseId?: string
+	status?: "pending" | "approved" | "rejected"
+}
+
+export interface PaginatedMilestoneReports {
+	data: MilestoneReport[]
+	total: number
 }
 
 // In-memory fallback store (used when Postgres is unavailable)
@@ -33,8 +49,38 @@ class InMemoryMilestoneStore {
 		return this.reports.filter((r) => r.status === "pending")
 	}
 
+	async listReports(
+		filters: MilestoneReportFilters = {},
+		page: number = 1,
+		pageSize: number = 10,
+	): Promise<PaginatedMilestoneReports> {
+		const { courseId, status } = filters
+		const filtered = this.reports
+			.filter((report) => (courseId ? report.course_id === courseId : true))
+			.filter((report) => (status ? report.status === status : true))
+			.sort((a, b) => b.submitted_at.localeCompare(a.submitted_at))
+
+		const offset = (page - 1) * pageSize
+		return {
+			data: filtered.slice(offset, offset + pageSize),
+			total: filtered.length,
+		}
+	}
+
 	async getReportById(id: number): Promise<MilestoneReport | null> {
 		return this.reports.find((r) => r.id === id) ?? null
+	}
+
+	async getReportsForScholar(
+		scholarAddress: string,
+		filters: MilestoneReportFilters = {},
+	): Promise<MilestoneReport[]> {
+		const { courseId, status } = filters
+		return this.reports
+			.filter((r) => r.scholar_address === scholarAddress)
+			.filter((r) => (courseId ? r.course_id === courseId : true))
+			.filter((r) => (status ? r.status === status : true))
+			.sort((a, b) => b.submitted_at.localeCompare(a.submitted_at))
 	}
 
 	async createReport(
@@ -116,6 +162,53 @@ export const milestoneStore = {
 		return result.rows
 	},
 
+	async listReports(
+		filters: MilestoneReportFilters = {},
+		page: number = 1,
+		pageSize: number = 10,
+	): Promise<PaginatedMilestoneReports> {
+		if (!isRealPool()) {
+			return inMemoryMilestoneStore.listReports(filters, page, pageSize)
+		}
+
+		const values: Array<string | number> = []
+		const conditions: string[] = []
+
+		if (filters.courseId) {
+			values.push(filters.courseId)
+			conditions.push(`course_id = $${values.length}`)
+		}
+
+		if (filters.status) {
+			values.push(filters.status)
+			conditions.push(`status = $${values.length}`)
+		}
+
+		const whereClause =
+			conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : ""
+		const totalResult = await pool.query(
+			`SELECT COUNT(*) AS total FROM milestone_reports ${whereClause}`,
+			values,
+		)
+		const total = Number(totalResult.rows[0]?.total ?? 0)
+		const offset = (page - 1) * pageSize
+		const rowValues = [...values, pageSize, offset]
+		const dataResult = await pool.query(
+			`SELECT *
+			 FROM milestone_reports
+			 ${whereClause}
+			 ORDER BY submitted_at DESC
+			 LIMIT $${rowValues.length - 1}
+			 OFFSET $${rowValues.length}`,
+			rowValues,
+		)
+
+		return {
+			data: dataResult.rows,
+			total,
+		}
+	},
+
 	async getReportById(id: number): Promise<MilestoneReport | null> {
 		if (!isRealPool()) return inMemoryMilestoneStore.getReportById(id)
 		const result = await pool.query(
@@ -123,6 +216,36 @@ export const milestoneStore = {
 			[id],
 		)
 		return result.rows[0] ?? null
+	},
+
+	async getReportsForScholar(
+		scholarAddress: string,
+		filters: MilestoneReportFilters = {},
+	): Promise<MilestoneReport[]> {
+		if (!isRealPool()) {
+			return inMemoryMilestoneStore.getReportsForScholar(
+				scholarAddress,
+				filters,
+			)
+		}
+
+		const values: Array<string> = [scholarAddress]
+		let sql = `SELECT * FROM milestone_reports WHERE scholar_address = $1`
+
+		if (filters.courseId) {
+			values.push(filters.courseId)
+			sql += ` AND course_id = $${values.length}`
+		}
+
+		if (filters.status) {
+			values.push(filters.status)
+			sql += ` AND status = $${values.length}`
+		}
+
+		sql += ` ORDER BY submitted_at DESC`
+
+		const result = await pool.query(sql, values)
+		return result.rows
 	},
 
 	async createReport(
