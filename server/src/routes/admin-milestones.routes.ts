@@ -1,5 +1,6 @@
 import { Router } from "express"
 import {
+	listMilestones,
 	getPendingMilestones,
 	getMilestoneById,
 	approveMilestone,
@@ -14,10 +15,12 @@ import {
 	rejectMilestoneBodySchema,
 } from "../lib/zod-schemas"
 import { requireAdmin } from "../middleware/admin.middleware"
+import { milestoneSubmissionLimiter } from "../middleware/rate-limit.middleware"
 import { validate } from "../middleware/validate.middleware"
-import { milestoneSubmitRateLimiter } from "../middleware/milestone-rate-limit.middleware"
 
 export const adminMilestonesRouter = Router()
+
+adminMilestonesRouter.get("/admin/milestones", requireAdmin, listMilestones)
 
 /**
  * @openapi
@@ -195,7 +198,7 @@ adminMilestonesRouter.post(
  */
 adminMilestonesRouter.post(
 	"/milestones/submit",
-	milestoneSubmitRateLimiter,
+	milestoneSubmissionLimiter,
 	validate({
 		body: legacyMilestoneSubmitBodySchema,
 	}),
@@ -204,7 +207,7 @@ adminMilestonesRouter.post(
 
 adminMilestonesRouter.post(
 	"/milestones",
-	milestoneSubmitRateLimiter,
+	milestoneSubmissionLimiter,
 	validate({
 		body: milestoneSubmitBodySchema,
 	}),
